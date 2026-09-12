@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 # ==============================================================================
-# 1. DATABASE INITIALIZATION & RELATIONAL SCHEMA (V.15 / V.15.1 SPECIFICATION)
+# 1. DATABASE INITIALIZATION & RELATIONAL SCHEMA (V.15 SPECIFICATION)
 # ==============================================================================
 DB_FILE = "ryft_v15_master.db"
 
@@ -15,6 +15,12 @@ def get_db_connection():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+def add_column_if_not_exists(cursor, table, col_name, col_type):
+    cursor.execute(f"PRAGMA table_info({table});")
+    existing = [row[1] for row in cursor.fetchall()]
+    if col_name not in existing:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type};")
 
 def init_db():
     conn = get_db_connection()
@@ -68,7 +74,7 @@ def init_db():
         FOREIGN KEY (city_id) REFERENCES locations(location_id) ON DELETE CASCADE
     )''')
 
-    # 3. Match Formats Table (Official 18 Formats)
+    # 3. Match Formats Table
     c.execute('''
     CREATE TABLE IF NOT EXISTS match_formats (
         format_id TEXT PRIMARY KEY,
@@ -112,7 +118,7 @@ def init_db():
         FOREIGN KEY (host_id) REFERENCES tournament_hosts(host_id) ON DELETE CASCADE
     )''')
 
-    # 6. Players Table (Master 38 Fields)
+    # 6. Players Table
     c.execute('''
     CREATE TABLE IF NOT EXISTS players (
         player_id TEXT PRIMARY KEY,
@@ -270,7 +276,15 @@ def init_db():
         changed_at TEXT NOT NULL
     )''')
 
-    # Seed All 18 Official Match Formats
+    # Safe Column Migrations for Existing Tables
+    add_column_if_not_exists(c, "players", "accuracy_s_rd", "REAL DEFAULT 0.0")
+    add_column_if_not_exists(c, "players", "accuracy_s_matches", "REAL DEFAULT 0.0")
+    add_column_if_not_exists(c, "players", "accuracy_s_diversity", "REAL DEFAULT 0.0")
+    add_column_if_not_exists(c, "match_logs", "pre_display_rating", "REAL DEFAULT 3.0")
+    add_column_if_not_exists(c, "match_logs", "post_display_rating", "REAL DEFAULT 3.0")
+    add_column_if_not_exists(c, "matches", "guardrails_summary", "TEXT DEFAULT '[]'")
+
+    # Seed All 18 Official Match Formats using in-place UPSERT (Never deletes referenced rows)
     official_formats = [
         ("STD_B03", "Best of 3 Sets", "MULTI_SET", 1.00, None, None),
         ("STD_B05", "Best of 5 Sets", "MULTI_SET", 1.00, None, None),
@@ -293,68 +307,71 @@ def init_db():
     ]
     for fid, fname, cat, mc, tg, tp in official_formats:
         c.execute("""
-            INSERT OR REPLACE INTO match_formats (format_id, format_name, category, mc_weight, target_games, total_points)
+            INSERT INTO match_formats (format_id, format_name, category, mc_weight, target_games, total_points)
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(format_id) DO UPDATE SET
+                format_name=excluded.format_name,
+                category=excluded.category,
+                mc_weight=excluded.mc_weight,
+                target_games=excluded.target_games,
+                total_points=excluded.total_points
         """, (fid, fname, cat, mc, tg, tp))
 
-    # Master Seed Parameters (Modules 1 to 8 + V15.1 Extension)
+    # Master Configuration Parameters
     master_params = [
-        # Module 1: Scale Bounds & Volatility
         ("R_MIN", 0.0000, 1, "Scale Floor", "Absolute rating floor.", "Clamps lowest possible rating to 0.0000."),
         ("R_MAX", 7.0000, 1, "Scale Ceiling", "Absolute unbreachable rating ceiling.", "Must remain 7.0000 to preserve tier definitions."),
-        ("R_ELITE_THRESHOLD", 6.3000, 1, "Elite Drag Gate", "Rating where exponential drag engages.", "Lowering (e.g. 6.0) applies drag earlier. Raising lets players climb higher."),
-        ("ELITE_DRAG_EXPONENT", 2.5, 1, "Elite Drag Exponent", "Curvature steepness of pro ceiling resistance.", "Higher values make 7.0000 impossible to reach."),
+        ("R_ELITE_THRESHOLD", 6.3000, 1, "Elite Drag Gate", "Rating where exponential drag engages.", "Lowering applies drag earlier."),
+        ("ELITE_DRAG_EXPONENT", 2.5, 1, "Elite Drag Exponent", "Curvature steepness of pro ceiling resistance.", "Higher values make 7.0000 harder to reach."),
+        ("POWER_MEAN_P", 3.0, 1, "Doubles Cubic Exponent", "Cubic weighting power mean for doubles.", "3.0 gives a 70/30 anchor weighting bias."),
+        ("LOGISTIC_BETA", 2.0, 1, "Logistic Scale Factor", "Logistic expectancy curve scale denominator.", "Lowering boosts upset rewards."),
         ("K_MAX", 0.4000, 1, "Beginner Max Volatility", "Base step volatility for players at R = 0.000.", "Higher values accelerate beginner tier progression."),
         ("K_MIN", 0.0800, 1, "Pro Min Volatility", "Base step volatility for players at R = 7.000.", "Lower values lock pro ratings tighter against variance."),
-        # Module 2: Team Balancing & Margin Entropy
-        ("POWER_MEAN_P", 3.0, 1, "Doubles Cubic Exponent", "Cubic weighting power mean for doubles.", "3.0 gives a 70/30 anchor weighting bias."),
-        ("LOGISTIC_BETA", 2.0, 1, "Logistic Scale Factor", "Logistic expectancy curve scale denominator.", "Lowering (1.8) boosts upset rewards; raising (2.5) softens swings."),
         ("MARGIN_BASE", 0.80, 1, "Margin Floor Factor", "Minimum score factor for narrow finishes.", "Points floor for tight 7-6 tiebreaks."),
-        ("MARGIN_SCALE", 0.40, 1, "Margin Blowout Scale", "Maximum bonus factor for blowouts.", "Full 6-0 blowout bonus = Base + Scale = 1.20 (+20%)."),
-        # Module 4: Fairness & Protection
+        ("MARGIN_SCALE", 0.40, 1, "Margin Blowout Scale", "Maximum bonus factor for blowouts.", "Full blowout bonus = Base + Scale = 1.20."),
         ("ELEVATOR_MARGIN_THRESH", 1.15, 1, "Elevator Margin Gate", "Score margin needed to trip 3x Elevator boost.", "Requires blowout (>= 1.15) to accelerate unranked smurfs."),
-        ("ELEVATOR_ACCEL_FACTOR", 3.0, 1, "Elevator Boost Multiplier", "Multiplier applied to provisional blowouts.", "Triples step size for unranked winners to exit novice tiers fast."),
-        ("MAX_ELEVATOR_DELTA", 0.7500, 1, "Elevator Placement Cap", "Max points a smurf can win in one blowout game.", "Bypasses casual daily ceiling up to +0.7500 points."),
-        # Module 5: Exchange Security & Multi-Window Caps
-        ("MAX_8H_EXCHANGE_CAP", 0.0000, 0, "8-Hour Rolling Cap", "Tight-window point transfer cap.", "Active when > 0.0000. Restricts tight collusion."),
-        ("MAX_12H_EXCHANGE_CAP", 0.0000, 0, "12-Hour Rolling Cap", "Half-day point transfer cap.", "Active when > 0.0000. Limits half-day farming."),
-        ("MAX_24H_EXCHANGE_CAP", 0.1500, 1, "24-Hour Casual Cap", "Net 24-hour casual transfer ceiling between 4 players.", "Prevents collusion rings from farming rating points."),
-        ("MAX_48H_EXCHANGE_CAP", 0.0000, 0, "48-Hour Rolling Cap", "Weekend point transfer cap.", "Active when > 0.0000. Restricts multi-day farming."),
+        ("ELEVATOR_ACCEL_FACTOR", 3.0, 1, "Elevator Boost Multiplier", "Multiplier applied to provisional blowouts.", "Triples step size for unranked winners."),
+        ("MAX_ELEVATOR_DELTA", 0.7500, 1, "Elevator Placement Cap", "Max points a smurf can win in one blowout game.", "Bypasses casual daily ceiling up to +0.7500."),
+        ("MAX_8H_EXCHANGE_CAP", 0.0000, 0, "8-Hour Rolling Cap", "Tight-window point transfer cap.", "Active when > 0.0000."),
+        ("MAX_12H_EXCHANGE_CAP", 0.0000, 0, "12-Hour Rolling Cap", "Half-day point transfer cap.", "Active when > 0.0000."),
+        ("MAX_24H_EXCHANGE_CAP", 0.1500, 1, "24-Hour Casual Cap", "Net 24-hour casual transfer ceiling between 4 players.", "Prevents friend groups from farming rating points."),
+        ("MAX_48H_EXCHANGE_CAP", 0.0000, 0, "48-Hour Rolling Cap", "Weekend point transfer cap.", "Active when > 0.0000."),
         ("SESSION_EXCHANGE_CAP", 0.3000, 1, "Verified Session Cap", "Elevated cap for verified club events with 6+ players.", "Doubles the daily limit for official club mixers."),
         ("MIN_SESSION_PLAYERS", 6, 1, "Session Participant Floor", "Min players required to unlock session cap.", "Events with fewer than 6 players revert to 0.1500 cap."),
-        # Module 6 & 7: Uncertainty & Bridges
-        ("RD_MIN", 30.0, 1, "Certainty Floor", "Absolute uncertainty floor.", "Prevents RD from dropping below 30.0 (maximum precision)."),
+        ("RD_MIN", 30.0, 1, "Certainty Floor", "Absolute uncertainty floor.", "Prevents RD from dropping below 30.0."),
         ("RD_MAX", 350.0, 1, "Unrated Starting RD", "Uncertainty assigned at registration.", "Baseline starting uncertainty for all new accounts."),
-        ("RD_INFO_VARIANCE", 65.0, 1, "Bayesian Contraction Speed", "Denominator in per-match RD shrinkage formula.", "Lower values shrink RD faster per match; higher values require more games."),
-        ("INACTIVITY_CONSTANT", 12.0, 1, "Inactivity Rust Rate", "Monthly temporal uncertainty growth.", "Points of RD regained per inactive month away from the court."),
+        ("RD_INFO_VARIANCE", 65.0, 1, "Bayesian Contraction Speed", "Denominator in per-match RD shrinkage formula.", "Lower values shrink RD faster per match."),
+        ("INACTIVITY_CONSTANT", 12.0, 1, "Inactivity Rust Rate", "Monthly temporal uncertainty growth.", "Points of RD regained per inactive month."),
         ("BRIDGE_RD_THRESHOLD", 80.0, 1, "Bridge Node Max RD", "Max RD to qualify as Bridge Node.", "Only players with RD <= 80 count as measuring travelers."),
-        ("BRIDGE_MIN_MATCHES", 5, 1, "Bridge Match Minimum", "Away matches required to link locations.", "Matches required before a traveler links two regional pools."),
+        ("BRIDGE_MIN_MATCHES", 5, 1, "Bridge Match Minimum", "Away matches required to link locations.", "Matches required before a traveler links regional pools."),
         ("LAMBDA_BRIDGE_DAMPING", 3.0, 1, "Tikhonov Bridge Lambda", "Traveler shock absorber damping parameter.", "Higher values require more travelers before an offset deploys."),
         ("CIRCUIT_BREAKER", 0.0250, 1, "Auto Cron Safety Ceiling", "Maximum shift per automated weekly cycle.", "Limits automated Sunday macro shifts to +/-0.0250."),
         ("ADMIN_OVERRIDE_MAX", 0.0750, 1, "Admin Sandbox Shift Window", "Max human-approved offset for unlinked cities.", "Ceiling for manual Admin calibration deployments."),
-        # Module 8: Rating Accuracy & 3-Tier Governance
         ("ACCURACY_WEIGHT_RD", 0.50, 1, "Accuracy Weight: RD", "Weight for Pillar 1 (Statistical Certainty).", "Controls influence of mathematical uncertainty (RD)."),
-        ("ACCURACY_WEIGHT_MATCHES", 0.25, 1, "Accuracy Weight: Matches", "Weight for Pillar 2 (Match Experience Depth).", "Controls importance of verified match volume."),
-        ("ACCURACY_WEIGHT_DIVERSITY", 0.25, 1, "Accuracy Weight: Diversity", "Weight for Pillar 3 (Network Diversity).", "Controls importance of playing unique human opponents."),
+        ("ACCURACY_WEIGHT_MATCHES", 0.25, 1, "Accuracy Weight: Matches", "Weight for Pillar 2 (Match Depth).", "Controls importance of verified match volume."),
+        ("ACCURACY_WEIGHT_DIVERSITY", 0.25, 1, "Accuracy Weight: Diversity", "Weight for Pillar 3 (Network Diversity).", "Controls importance of playing unique opponents."),
         ("TIER_PROVISIONAL_MAX", 69.99, 1, "Provisional Score Ceiling", "Upper score bound for Tier 1 [PR].", "Players with accuracy below this score remain Provisional."),
-        ("TIER_VERIFIED_MAX", 89.99, 1, "Verified Score Ceiling", "Upper score bound for Tier 2 Verified.", "Score required to cross from Verified to elite Anchor tier."),
+        ("TIER_VERIFIED_MAX", 89.99, 1, "Verified Score Ceiling", "Upper score bound for Tier 2 Verified.", "Score required to cross to elite Anchor tier."),
         ("TARGET_MATCHES_PROV", 3, 1, "Provisional Match Quota", "Target matches during onboarding placement.", "Matches needed to satisfy sample depth during placement."),
-        ("TARGET_OPPONENTS_PROV", 2, 1, "Provisional Opponent Quota", "Target opponents during onboarding placement.", "Opponents needed to satisfy network diversity during placement."),
-        ("TARGET_MATCHES_VERIFIED", 5, 1, "Verified Tier Match Quota", "Target matches required for Verified tier.", "Verified match count needed to achieve verified accuracy."),
-        ("TARGET_OPPONENTS_VERIFIED", 3, 1, "Verified Tier Opponent Quota", "Target opponents required for Verified tier.", "Distinct opponents needed to achieve verified accuracy."),
-        ("TARGET_MATCHES_ANCHOR", 15, 1, "Anchor Tier Match Quota", "Target matches required for Anchor tier.", "Match volume needed to achieve community benchmark grade."),
-        ("TARGET_OPPONENTS_ANCHOR", 8, 1, "Anchor Tier Opponent Quota", "Target opponents required for Anchor tier.", "Distinct opponents needed to achieve community benchmark grade."),
-        ("PROVISIONAL_RD_GATE", 100.0, 1, "Tri-Gate Max RD", "Uncertainty gate for provisional exit.", "RD must be at or below this threshold to exit [PR]."),
+        ("TARGET_OPPONENTS_PROV", 2, 1, "Provisional Opponent Quota", "Target opponents during onboarding placement.", "Opponents needed during placement."),
+        ("TARGET_MATCHES_VERIFIED", 5, 1, "Verified Tier Match Quota", "Target matches required for Verified tier.", "Verified match count needed for verified accuracy."),
+        ("TARGET_OPPONENTS_VERIFIED", 3, 1, "Verified Tier Opponent Quota", "Target opponents required for Verified tier.", "Distinct opponents needed for verified accuracy."),
+        ("TARGET_MATCHES_ANCHOR", 15, 1, "Anchor Tier Match Quota", "Target matches required for Anchor tier.", "Match volume needed for Anchor tier."),
+        ("TARGET_OPPONENTS_ANCHOR", 8, 1, "Anchor Tier Opponent Quota", "Target opponents required for Anchor tier.", "Distinct opponents needed for Anchor tier."),
+        ("PROVISIONAL_RD_GATE", 100.0, 1, "Tri-Gate Max RD", "Uncertainty gate for provisional exit.", "RD must be <= 100 to exit [PR]."),
         ("PROVISIONAL_MIN_MATCHES", 5, 1, "Tri-Gate Min Matches", "Match count gate for provisional exit.", "Verified matches required before [PR] badge clears."),
         ("PROVISIONAL_MIN_OPPONENTS", 3, 1, "Tri-Gate Min Opponents", "Network diversity gate for provisional exit.", "Unique opponents faced required before [PR] badge clears."),
-        # V15.1 Delay Extension
-        ("MAX_RETROACTIVE_INGESTION_DAYS", 7, 1, "Retroactive Cutoff Window", "Max age in days for tournament uploads.", "Batches older than this window are rejected by the gateway."),
-        ("ALLOW_ASYNC_TOURNAMENT_STACKING", 1, 1, "Async Additive Stacking Toggle", "Authorizes forward delta stacking.", "Permits delayed tournament results to stack additively without rewinding casual play.")
+        ("MAX_RETROACTIVE_INGESTION_DAYS", 7, 1, "Retroactive Cutoff Window", "Max age in days for tournament uploads.", "Batches older than this window are rejected."),
+        ("ALLOW_ASYNC_TOURNAMENT_STACKING", 1, 1, "Async Additive Stacking Toggle", "Authorizes forward delta stacking.", "Permits delayed tournament results to stack additively.")
     ]
     for k, v, act, tit, desc, tune in master_params:
         c.execute("""
-            INSERT OR IGNORE INTO global_config (param_key, param_value, is_active, title, description, tuning_guide)
+            INSERT INTO global_config (param_key, param_value, is_active, title, description, tuning_guide)
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(param_key) DO UPDATE SET
+                title=excluded.title,
+                description=excluded.description,
+                tuning_guide=excluded.tuning_guide
         """, (k, v, act, tit, desc, tune))
 
     conn.commit()
@@ -363,7 +380,7 @@ def init_db():
 init_db()
 
 # ==============================================================================
-# 2. V.15 COMPLETE ALGORITHMIC CALCULATION ENGINE
+# 2. V.15 COMPLETE ALGORITHMIC CALCULATION ENGINES
 # ==============================================================================
 class RyftEngineV15:
     @staticmethod
@@ -621,7 +638,7 @@ nav = st.sidebar.radio("Navigation", [
 ])
 
 # ------------------------------------------------------------------------------
-# TAB 1: SYSTEM DASHBOARD (WITH METRICS, AUDITS & BACKUP/RESTORE)
+# TAB 1: SYSTEM DASHBOARD
 # ------------------------------------------------------------------------------
 if nav == "📊 System Dashboard":
     st.title("System Health & Operational Overview")
@@ -740,7 +757,6 @@ elif nav == "🎾 Matches Hub":
         st.markdown("---")
         st.markdown("### Match Scorecard Entry")
 
-        # Dynamic Scoring Windows Based on Selected Format
         sets_recorded = []
         final_score_a, final_score_b = 0, 0
         total_games_a, total_games_b = 0, 0
@@ -1022,7 +1038,7 @@ elif nav == "🎾 Matches Hub":
         conn.close()
 
 # ------------------------------------------------------------------------------
-# TAB 3: PLAYERS ROSTER (ACCURACY BREAKDOWN, ANCHOR TOGGLE, PROGRESSION CHANGELOG)
+# TAB 3: PLAYERS ROSTER
 # ------------------------------------------------------------------------------
 elif nav == "👥 Players Roster":
     st.title("Players Directory & Calibration Roster")
@@ -1143,7 +1159,7 @@ elif nav == "👥 Players Roster":
                 st.dataframe(pcl_df, use_container_width=True)
 
 # ------------------------------------------------------------------------------
-# TAB 4: VENUES & LOCATIONS (CRUD FROM CLEAN SLATE)
+# TAB 4: VENUES & LOCATIONS (CRUD)
 # ------------------------------------------------------------------------------
 elif nav == "🏢 Venues & Locations (CRUD)":
     st.title("Venues & Geographical Topology")
@@ -1337,7 +1353,7 @@ elif nav == "🏢 Venues & Locations (CRUD)":
     conn.close()
 
 # ------------------------------------------------------------------------------
-# TAB 5: HAWKING REGIONAL CONTROL (SUGGESTED OFFSET REQUIRED MODAL)
+# TAB 5: HAWKING REGIONAL CONTROL
 # ------------------------------------------------------------------------------
 elif nav == "🌐 Hawking Regional Control":
     st.title("Hawking Macro Normalization & Regional Offset Control")
@@ -1377,7 +1393,7 @@ elif nav == "🌐 Hawking Regional Control":
                     st.rerun()
 
 # ------------------------------------------------------------------------------
-# TAB 6: GLOBAL CONFIG SWITCHES (FULL MATRIX & SYSTEM RESET)
+# TAB 6: GLOBAL CONFIG SWITCHES
 # ------------------------------------------------------------------------------
 elif nav == "⚙️ Global Config Switches":
     st.title("Algorithmic Bit Governance & Parameter Switches")
