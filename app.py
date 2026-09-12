@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import math
 import json
+import os
 from datetime import datetime, timezone
 import pandas as pd
 
@@ -195,7 +196,7 @@ def init_db():
         changed_at TEXT NOT NULL
     )''')
 
-    # Seed All 18 Official Match Formats
+    # Seed All 18 Official Formats[cite: 1]
     official_formats = [
         ("STD_B03", "Best of 3 Sets", "MULTI_SET", 1.00, None, None),
         ("STD_B05", "Best of 5 Sets", "MULTI_SET", 1.00, None, None),
@@ -222,7 +223,7 @@ def init_db():
             VALUES (?, ?, ?, ?, ?, ?)
         """, (fid, fname, cat, mc, tg, tp))
 
-    # Seed Config Parameters with Explanations
+    # Seed Config Parameters with Tuning Explainers[cite: 8]
     default_params = [
         ("R_MIN", 0.0000, 1, "Scale Absolute Floor", 
          "Lowest allowed rating.", 
@@ -307,36 +308,33 @@ class RyftEngineV15:
     @staticmethod
     def validate_score(format_id, category, target_games, total_points, score_a, score_b, sets_data):
         if category == "MULTI_SET":
-            valid_pairs = {(6,0),(6,1),(6,2),(6,3),(6,4),(7,5),(7,6),(0,6),(1,6),(2,6),(3,6),(4,6),(5,7),(6,7)}
-            sets_played = len(sets_data)
-            if sets_played < 2:
-                return False, "Multi-set formats require at least 2 completed sets."
+            valid_pairs = {(6,0),(6,1),(6,2),(6,3),(6,4),(7,5),(7,6),(0,6),(1,6),(2,6),(3,6),(4,6),(5,7),(6,7)}[cite: 1]
+            if len(sets_data) < 2:
+                return False, "Multi-set formats require at least 2 completed sets."[cite: 1]
             a_sets, b_sets = 0, 0
             for sa, sb in sets_data:
                 if (sa, sb) not in valid_pairs:
-                    return False, f"Invalid set scoreline: {sa}-{sb}. Must be 6-0..6-4, 7-5, or 7-6."
+                    return False, f"Invalid set scoreline: {sa}-{sb}. Must be 6-0..6-4, 7-5, or 7-6."[cite: 1]
                 if sa > sb: a_sets += 1
                 else: b_sets += 1
-            if format_id == "STD_B03":
-                if max(a_sets, b_sets) != 2:
-                    return False, "Best of 3 must terminate when one team wins 2 sets."
-            elif format_id == "STD_B05":
-                if max(a_sets, b_sets) != 3:
-                    return False, "Best of 5 must terminate when one team wins 3 sets."
+            if format_id == "STD_B03" and max(a_sets, b_sets) != 2:
+                return False, "Best of 3 must terminate when one team wins 2 sets."[cite: 1]
+            elif format_id == "STD_B05" and max(a_sets, b_sets) != 3:
+                return False, "Best of 5 must terminate when one team wins 3 sets."[cite: 1]
             return True, "Valid Multi-Set"
 
         elif category == "RACE_GAMES":
             tg = target_games or 6
             if (score_a == tg and score_b < tg) or (score_b == tg and score_a < tg):
-                return True, "Valid Target Race"
+                return True, "Valid Target Race"[cite: 1]
             if (score_a > tg or score_b > tg) and abs(score_a - score_b) == 2:
-                return True, "Valid Win-by-2 Extended Race"
-            return False, f"Invalid score for Race to {tg}. Must end at {tg}-X or win-by-2 beyond target."
+                return True, "Valid Win-by-2 Extended Race"[cite: 1]
+            return False, f"Invalid score for Race to {tg}. Must end at {tg}-X or win-by-2 beyond target."[cite: 1]
 
         elif category in ("AMERICANO", "MEXICANO"):
             tp = total_points or 24
             if (score_a + score_b) != tp:
-                return False, f"Sum of scores ({score_a} + {score_b} = {score_a+score_b}) must equal {tp} points."
+                return False, f"Sum of scores ({score_a} + {score_b} = {score_a+score_b}) must equal {tp} points."[cite: 1]
             return True, f"Valid {category}"
         return True, "Valid"
 
@@ -345,27 +343,23 @@ class RyftEngineV15:
         cfg = cls.get_configs()
         p_exp = cfg.get("POWER_MEAN_P", 3.0) or 3.0
 
-        # Bit 4: Team Weighting
         if is_singles:
             team_a_r, team_b_r = p1["latent_mmr"], p3["latent_mmr"]
         else:
             team_a_r = ((p1["latent_mmr"]**p_exp + p2["latent_mmr"]**p_exp) / 2.0)**(1.0 / p_exp)
             team_b_r = ((p3["latent_mmr"]**p_exp + p4["latent_mmr"]**p_exp) / 2.0)**(1.0 / p_exp)
 
-        # Bit 5: Logistic Win Expectancy
         beta = cfg.get("LOGISTIC_BETA", 2.0) or 2.0
         exp_a = 1.0 / (1.0 + 10.0**((team_b_r - team_a_r) / beta))
         act_a = 1.0 if score_a > score_b else (0.0 if score_b > score_a else 0.5)
         score_delta = act_a - exp_a
 
-        # Bit 6: Victory Margin Entropy
         m_base = cfg.get("MARGIN_BASE", 0.80) if cfg.get("MARGIN_BASE") is not None else 0.80
         m_scale = cfg.get("MARGIN_SCALE", 0.40) if cfg.get("MARGIN_SCALE") is not None else 0.40
         tot_games = games_w + games_l
         s_margin = m_base + (m_scale * ((games_w - games_l) / float(tot_games))) if tot_games > 0 else 1.000
         s_margin = max(0.800, min(1.200, s_margin))
 
-        # Bit 9: Format Multiplier
         conn = get_db_connection()
         fmt = conn.execute("SELECT mc_weight FROM match_formats WHERE format_id = ?", (format_id,)).fetchone()
         conn.close()
@@ -396,26 +390,22 @@ class RyftEngineV15:
             p_rd = p_data["rating_deviation"]
             is_winner = (is_team_a and score_a > score_b) or (not is_team_a and score_b > score_a)
             
-            # Bit 7: Base Volatility
             k_base = k_max - (r_curr / r_max) * (k_max - k_min)
 
-            # Bit 12: Elevator Protocol
             is_elevator = False
             el_thresh = cfg.get("ELEVATOR_MARGIN_THRESH", 1.15) or 1.15
             el_factor = cfg.get("ELEVATOR_ACCEL_FACTOR", 3.0) or 3.0
             if p_data["is_provisional"] and s_margin >= el_thresh and is_winner and r_curr < r_elite:
                 k_base *= el_factor
                 is_elevator = True
-                p_flags.append("ELEVATOR_3X_BOOST: Provisional player won by blowout; 3x step multiplier applied.")
+                p_flags.append("ELEVATOR_3X_BOOST: Provisional blowout victory; learning speed tripled.")
 
-            # Bit 8: Elite Exponential Drag
             decay = (r_max - r_curr) / r_max
             if r_curr >= r_elite:
                 decay *= ((r_max - r_curr) / (r_max - r_elite)) ** drag_exp
-                p_flags.append(f"ELITE_DRAG_ENGAGED: Rating >= {r_elite}; points gained dampened near 7.0 ceiling.")
+                p_flags.append(f"ELITE_DRAG_ENGAGED: Rating >= {r_elite}; point gains dampened near ceiling.")
             decay = max(0.0000001, decay)
 
-            # Bit 11: Glicko Opponent Buffer
             q = 0.0057565
             g_opp = 1.0 / math.sqrt(1.0 + (3.0 * (q**2) * (opp_rd**2)) / (math.pi**2))
             w_trust = 0.0000 if p_data["is_quarantined"] else min(1.0, p_data["graph_centrality"] / 0.20)
@@ -425,7 +415,6 @@ class RyftEngineV15:
             direction = 1.0 if is_team_a else -1.0
             raw_delta = (k_base * decay * mc * s_margin * w_trust * g_opp) * (direction * score_delta)
 
-            # Bit 10: Asymmetric Ice-Out Protection
             dampened_delta = raw_delta
             if not is_singles and partner_r is not None:
                 gap = abs(r_curr - partner_r)
@@ -441,10 +430,9 @@ class RyftEngineV15:
                     dampened_delta = raw_delta * d_factor
                     p_flags.append(f"ICE_OUT_NOVICE_DAMPENED: Partner gap >= {gap:.1f}; anti-carry gain reduced by {int((1-d_factor)*100)}%.")
 
-            # Bit 13/14/15: Exchange Cap Clamping
             if is_tournament:
                 final_delta = dampened_delta
-                p_flags.append("TOURNAMENT_OVERRIDE: Verified tournament match; all daily caps bypassed.")
+                p_flags.append("TOURNAMENT_OVERRIDE: Verified tournament desk match; daily caps bypassed.")
             elif is_elevator:
                 max_el = cfg.get("MAX_ELEVATOR_DELTA", 0.7500) or 0.7500
                 final_delta = max(-max_el, min(max_el, dampened_delta))
@@ -452,17 +440,15 @@ class RyftEngineV15:
                 cap_24 = cfg.get("MAX_24H_EXCHANGE_CAP", 0.1500) or 0.1500
                 final_delta = max(-cap_24, min(cap_24, dampened_delta))
                 if abs(dampened_delta) > cap_24:
-                    p_flags.append("24H_EXCHANGE_CAP_CLAMPED: Hit daily casual exchange ceiling (0.1500 points).")
+                    p_flags.append("24H_EXCHANGE_CAP_CLAMPED: Reached daily casual exchange ceiling (0.1500 points).")
 
             new_r = max(0.0000, min(6.9999, r_curr + final_delta))
 
-            # Bit 11: Bayesian Uncertainty Contraction
             sigma_info = cfg.get("RD_INFO_VARIANCE", 65.0) or 65.0
             inv_prior = 1.0 / (p_rd**2)
             inv_info = (mc * s_margin * (g_opp**2)) / (sigma_info**2)
             new_rd = max(30.0, min(350.0, math.sqrt(1.0 / (inv_prior + inv_info))))
 
-            # Bit 25: Rating Accuracy & Calibration Tier
             s_rd = max(0.0, min(1.0, (350.0 - new_rd) / (350.0 - 30.0)))
             new_matches = p_data["verified_matches_count"] + (0 if is_dry_run else 1)
             new_opps = p_data["unique_opponents_count"] + (0 if is_dry_run else 1)
@@ -516,7 +502,7 @@ nav = st.sidebar.radio("Navigation", [
 ])
 
 # ------------------------------------------------------------------------------
-# TAB 1: SYSTEM DASHBOARD
+# TAB 1: SYSTEM DASHBOARD (WITH BACKUP & RESTORE TOOL)
 # ------------------------------------------------------------------------------
 if nav == "📊 System Dashboard":
     st.title("System Health & Operational Overview")
@@ -532,6 +518,38 @@ if nav == "📊 System Dashboard":
     m2.metric("Matches Completed", n_m)
     m3.metric("Registered Venues", n_v)
     m4.metric("Active Municipalities", n_c)
+
+    # 1-CLICK BACKUP & RESTORE TOOL
+    with st.expander("💾 Database Backup & Restore (Zero Data Loss Safeguard)"):
+        st.caption("Safeguard your test data against free cloud container reboots.")
+        col_bk1, col_bk2 = st.columns(2)
+        with col_bk1:
+            st.markdown("#### 📥 Backup Data")
+            st.write("Download your entire database file to your computer or phone after a match session.")
+            if os.path.exists(DB_FILE):
+                with open(DB_FILE, "rb") as f:
+                    db_bytes = f.read()
+                st.download_button(
+                    label="⬇️ Download Database Snapshot (.db)",
+                    data=db_bytes,
+                    file_name=f"ryft_v15_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+                    mime="application/octet-stream",
+                    use_container_width=True
+                )
+            else:
+                st.info("No database file found on disk.")
+
+        with col_bk2:
+            st.markdown("#### 📤 Restore Data")
+            st.write("Upload a previously downloaded `.db` file to recover all players, venues, and matches.")
+            uploaded_db = st.file_uploader("Choose backup .db file", type=["db", "sqlite", "sqlite3"])
+            if uploaded_db is not None:
+                if st.button("🚨 Restore Database From File", type="primary", use_container_width=True):
+                    with open(DB_FILE, "wb") as f:
+                        f.write(uploaded_db.getbuffer())
+                    init_db()
+                    st.success("Database successfully restored! All historical records recovered.")
+                    st.rerun()
 
     st.subheader("Live Verification Ledger & Recent Audits")
     conn = get_db_connection()
@@ -549,7 +567,7 @@ if nav == "📊 System Dashboard":
         st.info("No match audits committed yet. Log a match under 'Matches Hub'.")
 
 # ------------------------------------------------------------------------------
-# TAB 2: MATCHES HUB (SIMULATOR, LOGGER & ALL MATCHES LEDGER)
+# TAB 2: MATCHES HUB (DYNAMIC SCORING, ALL MATCHES LEDGER, UNDO)
 # ------------------------------------------------------------------------------
 elif nav == "🎾 Matches Hub":
     st.title("Matches Management & Verification Hub")
@@ -603,7 +621,7 @@ elif nav == "🎾 Matches Hub":
         st.markdown("---")
         st.markdown("### Match Scorecard Entry")
 
-        # Dynamic Scoring Windows
+        # Dynamic Scoring Windows Based on Selected Format[cite: 1]
         sets_recorded = []
         final_score_a, final_score_b = 0, 0
         total_games_a, total_games_b = 0, 0
@@ -613,8 +631,7 @@ elif nav == "🎾 Matches Hub":
             fid = selected_fmt["format_id"]
 
             if cat == "MULTI_SET":
-                st.info(f"**Multi-Set Format ({selected_fmt['format_name']}):** Standard FIP sets (6-0..6-4, 7-5, 7-6).")
-                max_sets = 3 if fid == "STD_B03" else 5
+                st.info(f"**Multi-Set Format ({selected_fmt['format_name']}):** Standard FIP sets (6-0..6-4, 7-5, 7-6).")[cite: 1]
                 
                 s1_c1, s1_c2 = st.columns(2)
                 s1_a = s1_c1.number_input("Set 1: Team A Games", 0, 7, 6, key="s1_a")
@@ -630,7 +647,7 @@ elif nav == "🎾 Matches Hub":
                 b_sets = (1 if s1_b > s1_a else 0) + (1 if s2_b > s2_a else 0)
 
                 if a_sets == 1 and b_sets == 1:
-                    st.warning("Sets are tied 1-1. Set 3 inputs unlocked:")
+                    st.warning("Sets are tied 1-1. Set 3 decider inputs unlocked:")[cite: 1]
                     s3_c1, s3_c2 = st.columns(2)
                     s3_a = s3_c1.number_input("Set 3 (Decider): Team A Games", 0, 7, 6, key="s3_a")
                     s3_b = s3_c2.number_input("Set 3 (Decider): Team B Games", 0, 7, 4, key="s3_b")
@@ -644,7 +661,7 @@ elif nav == "🎾 Matches Hub":
 
             elif cat == "RACE_GAMES":
                 tg = selected_fmt["target_games"] or 6
-                st.info(f"**Single-Set Race ({selected_fmt['format_name']}):** First to {tg} games or win-by-2 beyond {tg}.")
+                st.info(f"**Single-Set Race ({selected_fmt['format_name']}):** First to {tg} games or win-by-2 beyond {tg}.")[cite: 1]
                 rg_c1, rg_c2 = st.columns(2)
                 total_games_a = rg_c1.number_input("Team A Games Won", 0, 30, tg, key="rg_a")
                 total_games_b = rg_c2.number_input("Team B Games Won", 0, 30, max(0, tg-2), key="rg_b")
@@ -654,7 +671,7 @@ elif nav == "🎾 Matches Hub":
 
             elif cat in ("AMERICANO", "MEXICANO"):
                 tp = selected_fmt["total_points"] or 24
-                st.info(f"**Fixed-Point Format ({selected_fmt['format_name']}):** Scores MUST sum to exactly {tp} points.")
+                st.info(f"**Fixed-Point Format ({selected_fmt['format_name']}):** Scores MUST sum to exactly {tp} points.")[cite: 1]
                 ap_c1, ap_c2 = st.columns(2)
                 total_games_a = ap_c1.number_input("Team A Points Won", 0, tp, tp // 2, key="ap_a")
                 total_games_b = ap_c2.number_input("Team B Points Won", 0, tp, tp - (tp // 2), key="ap_b")
@@ -808,8 +825,7 @@ elif nav == "🎾 Matches Hub":
         st.subheader("All Matches Ledger & Deep Card Inspector")
         conn = get_db_connection()
         
-        # Filters Bar
-        f_c1, f_c2, f_c3 = st.columns(3)
+        f_c1, f_c2 = st.columns(2)
         sort_order = f_c1.selectbox("Sort By Timestamp", ["Newest First", "Oldest First"])
         ven_filter = f_c2.selectbox("Filter by Venue", ["All Venues"] + list(v_map.keys()))
         
@@ -859,7 +875,6 @@ elif nav == "🎾 Matches Hub":
                     st.markdown("---")
                     st.write(f"**Scorelines:** Sets: `{m['set_scores_json']}` | MOV Multiplier: `{m['applied_s_margin']:.4f}` | Recorded: `{m['match_timestamp']}`")
 
-                    # Drill down into granular player audit rows
                     p_logs = conn.execute("""
                         SELECT ml.*, p.display_name 
                         FROM match_logs ml 
@@ -982,7 +997,6 @@ elif nav == "👥 Players Roster":
                         st.success("Player overrides committed!")
                         st.rerun()
 
-                # View Player Historical Audit Trail
                 st.markdown("##### Progression Changelog")
                 conn = get_db_connection()
                 pcl_df = pd.read_sql_query("SELECT change_type, old_val, new_val, changed_by, changed_at FROM player_changelog WHERE player_id = ? ORDER BY changed_at DESC", conn, params=[p_sel_id])
@@ -1224,10 +1238,10 @@ elif nav == "🌐 Hawking Regional Control":
                     st.rerun()
 
 # ------------------------------------------------------------------------------
-# TAB 6: GLOBAL CONFIG SWITCHES (EXPLAINERS, CHANGELOG & RESET)
+# TAB 6: GLOBAL CONFIG SWITCHES (EXPLAINERS, CHANGELOG & NUCLEAR RESET)
 # ------------------------------------------------------------------------------
 elif nav == "⚙️ Global Config Switches":
-    st.title("Algorithmic Bit Governance & Parameter Switches")
+    st.title("Algorithmic Bit Governance & Parameter Matrix")
     st.caption("Tune operational parameters with real-time operational explainers and system changelogs.")
 
     conn = get_db_connection()
@@ -1265,10 +1279,10 @@ elif nav == "⚙️ Global Config Switches":
     else:
         st.info("No configuration changes recorded yet.")
 
-    # NUCLEAR RESET / CLEAN SLATE
+    # NUCLEAR RESET TOOL
     st.markdown("---")
     with st.expander("🚨 System Clean Slate / Nuclear Reset"):
-        st.caption("Wipe test data and reset tables to start from scratch.")
+        st.caption("Wipe test data and reset tables to start completely from scratch.")
         if st.button("💣 Erase All Matches & Test Data (Clean Slate)", type="secondary"):
             conn = get_db_connection()
             conn.execute("DELETE FROM match_logs;")
@@ -1280,5 +1294,5 @@ elif nav == "⚙️ Global Config Switches":
             conn.execute("DELETE FROM player_changelog;")
             conn.commit()
             conn.close()
-            st.success("All data erased. System initialized to clean slate.")
+            st.success("All data erased. System reset to a clean slate.")
             st.rerun()
