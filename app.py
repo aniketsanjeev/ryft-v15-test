@@ -22,7 +22,7 @@ def add_column_if_not_exists(cursor, table, col_name, col_type):
     if col_name not in existing:
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type};")
 
-def init_db():
+def init_db(force_sync_params=False):
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("PRAGMA foreign_keys = ON;")
@@ -248,6 +248,7 @@ def init_db():
     add_column_if_not_exists(c, "match_logs", "post_display_rating", "REAL DEFAULT 3.0")
     add_column_if_not_exists(c, "matches", "guardrails_summary", "TEXT DEFAULT '[]'")
 
+    # Seed 18 Official Match Formats
     official_formats = [
         ("STD_B03", "Best of 3 Sets", "MULTI_SET", 1.00, None, None),
         ("STD_B05", "Best of 5 Sets", "MULTI_SET", 1.00, None, None),
@@ -283,7 +284,7 @@ def init_db():
     master_params = [
         ("R_MIN", 0.0000, 1, "Scale Absolute Floor", "Lowest allowed rating.", "Clamps lowest possible rating to 0.0000."),
         ("R_MAX", 7.0000, 1, "Scale Absolute Ceiling", "Maximum rating bound.", "Locked at 7.0000 to preserve tier definitions."),
-        ("R_ELITE_THRESHOLD", 6.3000, 1, "Elite Drag Gate", "Rating where exponential drag starts.", "Lowering (e.g. 6.0) activates drag earlier."),
+        ("R_ELITE_THRESHOLD", 6.3000, 1, "Elite Drag Gate", "Rating where exponential drag starts.", "Lowering applies drag earlier."),
         ("ELITE_DRAG_EXPONENT", 2.5, 1, "Elite Drag Curvature", "Steepness of the pro ceiling curve.", "Higher values make 7.0000 harder to reach."),
         ("POWER_MEAN_P", 3.0, 1, "Doubles Cubic Exponent", "Anchor power mean weighting.", "3.0 gives a 70/30 anchor weighting bias."),
         ("LOGISTIC_BETA", 2.0, 1, "Logistic Scale Factor", "Win odds sensitivity.", "Lowering (1.8) increases upset swings."),
@@ -291,7 +292,7 @@ def init_db():
         ("K_MIN", 0.0800, 1, "Pro Min Volatility", "Base step size at R = 7.000.", "Lower values lock pro ratings tighter."),
         ("MARGIN_BASE", 0.80, 1, "Margin Floor Factor", "Minimum factor for close games.", "Floor for 7-6 tiebreaks."),
         ("MARGIN_SCALE", 0.40, 1, "Margin Blowout Scale", "Bonus multiplier for blowouts.", "Full blowout bonus = 1.20."),
-        ("ELEVATOR_MARGIN_THRESH", 1.10, 1, "Elevator Margin Gate", "Margin required for 3x boost.", "Lowered to 1.10 so 6-0, 6-1 triggers the Elevator."),
+        ("ELEVATOR_MARGIN_THRESH", 1.1000, 1, "Elevator Margin Gate", "Margin required for 3x boost.", "Set to 1.10 so 6-0, 6-1 triggers the Elevator."),
         ("ELEVATOR_ACCEL_FACTOR", 3.0, 1, "Elevator Boost Multiplier", "Multiplier applied to provisional blowouts.", "Triples step size for unranked winners."),
         ("MAX_ELEVATOR_DELTA", 0.7500, 1, "Elevator Placement Cap", "Max points a smurf can win in one blowout game.", "Bypasses casual daily ceiling up to +0.7500."),
         ("MAX_8H_EXCHANGE_CAP", 0.0000, 0, "8-Hour Rolling Cap", "Tight-window point transfer cap.", "Active when > 0.0000."),
@@ -302,7 +303,7 @@ def init_db():
         ("MIN_SESSION_PLAYERS", 6, 1, "Session Participant Floor", "Min players required to unlock session cap.", "Events below 6 revert to 0.1500 cap."),
         ("RD_MIN", 30.0, 1, "Certainty Floor", "Absolute uncertainty floor.", "Prevents RD from dropping below 30.0."),
         ("RD_MAX", 350.0, 1, "Unrated Starting RD", "Uncertainty assigned at registration.", "Baseline starting uncertainty for new accounts."),
-        ("RD_CONTRACTION_DENOMINATOR", 110000.0, 1, "RD Contraction Divisor", "Information precision denominator.", "Re-calibrated so RD contracts 350 -> 240 in Match 1."),
+        ("RD_CONTRACTION_DENOMINATOR", 110000.0, 1, "RD Contraction Divisor", "Information precision denominator.", "Calibrated so RD steps down 350 -> 240 smoothly."),
         ("INACTIVITY_CONSTANT", 12.0, 1, "Inactivity Rust Rate", "Monthly temporal uncertainty growth.", "Points of RD regained per inactive month."),
         ("BRIDGE_RD_THRESHOLD", 80.0, 1, "Bridge Node Max RD", "Max RD to qualify as Bridge Node.", "Must have RD <= 80 to act as measuring traveler."),
         ("BRIDGE_MIN_MATCHES", 5, 1, "Bridge Match Minimum", "Away matches required to link locations.", "Matches required before a traveler links regional pools."),
@@ -325,14 +326,26 @@ def init_db():
         ("PROVISIONAL_MIN_OPPONENTS", 3, 1, "Tri-Gate Min Opponents", "Network diversity gate for provisional exit.", "Unique opponents faced required before [PR] badge clears.")
     ]
     for k, v, act, tit, desc, tune in master_params:
-        c.execute("""
-            INSERT INTO global_config (param_key, param_value, is_active, title, description, tuning_guide)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(param_key) DO UPDATE SET
-                title=excluded.title,
-                description=excluded.description,
-                tuning_guide=excluded.tuning_guide
-        """, (k, v, act, tit, desc, tune))
+        if force_sync_params:
+            c.execute("""
+                INSERT INTO global_config (param_key, param_value, is_active, title, description, tuning_guide)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(param_key) DO UPDATE SET
+                    param_value=excluded.param_value,
+                    is_active=excluded.is_active,
+                    title=excluded.title,
+                    description=excluded.description,
+                    tuning_guide=excluded.tuning_guide
+            """, (k, v, act, tit, desc, tune))
+        else:
+            c.execute("""
+                INSERT INTO global_config (param_key, param_value, is_active, title, description, tuning_guide)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(param_key) DO UPDATE SET
+                    title=excluded.title,
+                    description=excluded.description,
+                    tuning_guide=excluded.tuning_guide
+            """, (k, v, act, tit, desc, tune))
 
     conn.commit()
     conn.close()
@@ -428,17 +441,12 @@ class RyftEngineV15:
         rd_min = cfg.get("RD_MIN", 30.0) or 30.0
         rd_max = cfg.get("RD_MAX", 350.0) or 350.0
         
-        # Pillar 1: Statistical Certainty Score (0.0 to 1.0)
         s_rd = max(0.0, min(1.0, (rd_max - rd) / (rd_max - rd_min)))
 
-        # Dynamic Targets: Anchor targets are always 15 and 8
         t_matches = 15.0 if (match_count >= 5 and rd <= 100.0) else 5.0
         t_opps = 8.0 if (match_count >= 5 and rd <= 100.0) else 3.0
 
-        # Pillar 2: Match Sample Depth Score (0.0 to 1.0)
         s_matches = min(1.0, match_count / float(t_matches))
-
-        # Pillar 3: Opponent Network Diversity Score (0.0 to 1.0)
         s_diversity = min(1.0, opp_count / float(t_opps))
 
         w_rd = cfg.get("ACCURACY_WEIGHT_RD", 0.50) if cfg.get("ACCURACY_WEIGHT_RD") is not None else 0.50
@@ -447,7 +455,6 @@ class RyftEngineV15:
 
         composite_acc = round(((w_rd * s_rd) + (w_m * s_matches) + (w_d * s_diversity)) * 100.0, 2)
 
-        # Tri-Gate Provisional Exit Enforcement
         prov_rd_gate = cfg.get("PROVISIONAL_RD_GATE", 100.0) or 100.0
         prov_min_m = cfg.get("PROVISIONAL_MIN_MATCHES", 5) or 5
         prov_min_d = cfg.get("PROVISIONAL_MIN_OPPONENTS", 3) or 3
@@ -458,7 +465,6 @@ class RyftEngineV15:
         tier_prov_max = cfg.get("TIER_PROVISIONAL_MAX", 69.99) or 69.99
         tier_ver_max = cfg.get("TIER_VERIFIED_MAX", 89.99) or 89.99
 
-        # Anchor Tier requires: RD <= 60.0 AND Matches >= 15 AND Opponents >= 8
         if composite_acc >= tier_ver_max and new_is_prov == 0 and rd <= 60.0 and match_count >= 15 and opp_count >= 8:
             cal_tier = "ANCHOR"
         elif (composite_acc >= tier_prov_max or tri_gate_passed) and new_is_prov == 0:
@@ -568,9 +574,9 @@ class RyftEngineV15:
                 k_base *= speed_mult
                 p_flags.append(f"SPEED_RULE_APPLIED: Adjusted by {speed_mult:.2f}x for rating tier.")
 
-            # Bit 12: Elevator Protocol (Threshold = 1.10)
+            # Bit 12: Elevator Protocol (Enforces threshold gate)
             is_elevator = False
-            el_thresh = cfg.get("ELEVATOR_MARGIN_THRESH", 1.10) or 1.10
+            el_thresh = cfg.get("ELEVATOR_MARGIN_THRESH", 1.1000) or 1.1000
             el_factor = cfg.get("ELEVATOR_ACCEL_FACTOR", 3.0) or 3.0
             if p_data["is_provisional"] and s_margin >= el_thresh and is_winner and r_curr < r_elite:
                 k_base *= el_factor
@@ -658,7 +664,7 @@ class RyftEngineV15:
         }
 
 # ==============================================================================
-# 3. STREAMLIT FRONT-END APPARATUS
+# 3. STREAMLIT COMMAND & OPERATIONAL INTERFACE
 # ==============================================================================
 st.set_page_config(page_title="RYFT Engine V.15 Platform", layout="wide")
 
@@ -1147,7 +1153,6 @@ elif nav == "📜 Historical Matches":
                         st.write("• **Bit 25 (3-Tier Accuracy):** Recomputed")
                 st.markdown("---")
 
-    # CLEAR LOG UTILITY
     st.markdown("### 🚨 Clear Log & Match Rollback Utility")
     with st.expander("⚠️ Clear Matches & Revert Ratings"):
         st.caption("Selectively revert the latest match or delete matches within a date range, restoring player ratings.")
@@ -1598,6 +1603,8 @@ elif nav == "🏢 Venues & Locations (CRUD)":
                         conn.commit()
                         st.success(f"Added {con} ({coc})!")
                         st.rerun()
+                    else:
+                        st.error("Fields cannot be empty.")
 
         with co2:
             st.markdown("#### ✏️ Delete Country")
@@ -1657,6 +1664,14 @@ elif nav == "🌐 Hawking Regional Control":
 elif nav == "⚙️ Global Config Switches":
     st.title("Algorithmic Bit Governance & Parameter Switches")
     st.caption("Tune operational parameters live with directional tuning guides and customize progression speeds.")
+
+    # FORCE PARAMETER SYNC TOOL
+    with st.expander("🔄 Force Sync Parameter Defaults (Fix Stale Parameters)"):
+        st.write("Updates existing database parameters to the latest code defaults (e.g. Setting Elevator Threshold to 1.10) without touching player or match tables.")
+        if st.button("Sync Config Parameters to V.15 Defaults", type="primary"):
+            init_db(force_sync_params=True)
+            st.success("Successfully synchronized all config parameters to latest V.15 defaults!")
+            st.rerun()
 
     st.markdown("### 🎚️ Progression Speed Controller (By Rating Range)")
     conn = get_db_connection()
