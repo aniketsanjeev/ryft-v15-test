@@ -287,7 +287,7 @@ def init_db(force_sync_params=False):
         ("R_MIN", 0.0000, 1, "Scale Absolute Floor", "Lowest allowed rating.", "Clamps lowest possible rating to 0.0000. Keep at 0.0000."),
         ("R_MAX", 7.0000, 1, "Scale Absolute Ceiling", "Maximum rating bound.", "Locked at 7.0000 to preserve tier definitions. Never set above 7.0000."),
         ("R_ELITE_THRESHOLD", 6.3000, 1, "Elite Drag Gate", "Rating where exponential drag starts.", "Lowering (e.g. to 6.000) applies drag earlier to lock pro tiers."),
-        ("ELITE_DRAG_EXPONENT", 2.5, 1, "Elite Drag Curvature", "Steepness of the pro ceiling curve.", "Higher values (3.0-3.5) make 7.0000 mathematically unbreachable."),
+        ("ELITE_DRAG_EXPONENT", 2.5, 1, "Elite Drag Curvature", "Steepness of the pro ceiling curve.", "Higher values (3.0-3.5) make 7.0000 harder to reach."),
         ("POWER_MEAN_P", 3.0, 1, "Doubles Cubic Exponent", "Anchor power mean weighting.", "3.0 gives a 70/30 anchor weighting bias toward stronger partner."),
         ("LOGISTIC_BETA", 2.0, 1, "Logistic Scale Factor", "Win odds sensitivity.", "Lowering (1.8) increases upset swings; raising (2.5) softens rating movement."),
         ("K_MAX", 0.4000, 1, "Beginner Max Volatility", "Base step size at R = 0.000.", "Higher values accelerate beginner movement out of bottom tier."),
@@ -303,8 +303,8 @@ def init_db(force_sync_params=False):
         ("MAX_12H_EXCHANGE_CAP", 0.0000, 0, "12-Hour Rolling Cap", "Half-day point transfer cap.", "Active when > 0.0000."),
         ("MAX_24H_EXCHANGE_CAP", 0.1500, 1, "24-Hour Casual Cap", "Net 24-hour casual transfer ceiling.", "Prevents collusion farming among friend pods."),
         ("MAX_48H_EXCHANGE_CAP", 0.0000, 0, "48-Hour Rolling Cap", "Weekend point transfer cap.", "Active when > 0.0000."),
-        ("PROVISIONAL_BYPASS_EXCHANGE_CAP", 1.0000, 1, "Provisional Cap Bypass / Relax", "Allows unranked players to swing wider.", "1.0 = Active; applies PROVISIONAL_CAP_MULTIPLIER to 24h cap."),
-        ("PROVISIONAL_CAP_MULTIPLIER", 2.5000, 1, "Provisional Cap Multiplier", "Multiplier on daily cap for provisional players.", "e.g. 2.5x on 0.1500 = 0.3750 cap for provisional accounts."),
+        ("PROVISIONAL_BYPASS_EXCHANGE_CAP", 1.0000, 1, "Provisional Cap Relax Switch", "Allows provisional players wider rating swings.", "1.0 = Active (applies PROVISIONAL_CAP_MULTIPLIER to 24h cap). 0.0 = Standard cap."),
+        ("PROVISIONAL_CAP_MULTIPLIER", 2.5000, 1, "Provisional Cap Multiplier", "Scale multiplier on daily cap for provisional players.", "2.5x on 0.1500 = 0.3750 cap for provisional accounts."),
         ("SESSION_EXCHANGE_CAP", 0.3000, 1, "Verified Session Cap", "Elevated cap for verified 6+ player events.", "Doubles the daily limit for club mixers."),
         ("MIN_SESSION_PLAYERS", 6, 1, "Session Participant Floor", "Min players required to unlock session cap.", "Events below 6 revert to casual cap."),
         
@@ -313,7 +313,7 @@ def init_db(force_sync_params=False):
         ("RD_MAX", 350.0, 1, "Unrated Starting RD", "Uncertainty assigned at registration.", "Baseline starting uncertainty for new accounts."),
         ("RD_CONTRACTION_DENOMINATOR", 110000.0, 1, "RD Contraction Divisor", "Information precision denominator.", "Calibrated divisor for Bayesian RD shrinkage."),
         ("PROVISIONAL_RD_CONTRACTION_RATIO", 0.3500, 1, "Provisional RD Contraction Speed", "Slows RD drop for unranked players.", "0.35 = Provisional players shrink RD at 35% speed of verified players."),
-        ("PROVISIONAL_ACCURACY_DAMPENER", 0.4000, 1, "Provisional Accuracy Gain Dampener", "Restricts accuracy gain during placement.", "0.40 = Accuracy moves up marginally (40% speed) until verified."),
+        ("PROVISIONAL_ACCURACY_DAMPENER", 0.4000, 1, "Provisional Accuracy Gain Dampener", "Restricts accuracy gain during placement.", "0.40 = Accuracy moves up at 40% speed while provisional."),
         ("INACTIVITY_CONSTANT", 12.0, 1, "Inactivity Rust Rate", "Monthly temporal uncertainty growth.", "Points of RD regained per inactive month away from court."),
         
         # Provisional Cohort Factors (Omega Cohort)
@@ -636,14 +636,23 @@ class RyftEngineV15:
             direction = 1.0 if is_team_a else -1.0
             raw_delta = (k_base * decay * mc * s_margin * w_trust * g_opp) * (direction * score_delta)
 
-            # Bit 10: Asymmetric Ice-Out Protection
+            # Bit 10: Status-Dependent Asymmetric Ice-Out Protection (Option A)
             dampened_delta = raw_delta
             if not is_singles and partner_r is not None:
                 gap = abs(r_curr - partner_r)
-                d_factor = 1.0
-                if gap >= 2.0: d_factor = 0.05
-                elif gap >= 1.5: d_factor = 0.20
-                elif gap >= 1.0: d_factor = 0.50
+
+                # Softened curve for provisional players to allow smurfs to climb
+                if is_prov:
+                    if gap >= 2.50: d_factor = 0.25
+                    elif gap >= 1.75: d_factor = 0.50
+                    elif gap >= 1.20: d_factor = 0.75
+                    else: d_factor = 1.00
+                else:
+                    # Strict anti-boosting curve for established verified players
+                    if gap >= 2.0: d_factor = 0.05
+                    elif gap >= 1.5: d_factor = 0.20
+                    elif gap >= 1.0: d_factor = 0.50
+                    else: d_factor = 1.00
 
                 if raw_delta < 0 and r_curr > partner_r and d_factor < 1.0:
                     dampened_delta = raw_delta * d_factor
@@ -654,7 +663,7 @@ class RyftEngineV15:
 
             # Exchange Cap Clamping with Provisional Cap Multiplier
             cap_24 = cfg.get("MAX_24H_EXCHANGE_CAP", 0.1500) or 0.1500
-            prov_cap_bypass = cfg.get("PROVISIONAL_BYPASS_EXCHANGE_CAP", 1.0) or 1.0
+            prov_cap_bypass = cfg.get("PROVISIONAL_BYPASS_EXCHANGE_CAP", 1.0) if cfg.get("PROVISIONAL_BYPASS_EXCHANGE_CAP") is not None else 1.0
             prov_cap_mult = cfg.get("PROVISIONAL_CAP_MULTIPLIER", 2.5) or 2.5
 
             if is_prov and prov_cap_bypass == 1.0:
@@ -688,12 +697,7 @@ class RyftEngineV15:
 
             # Decoupled Bayesian Uncertainty Contraction
             rd_denom = cfg.get("RD_CONTRACTION_DENOMINATOR", 110000.0) or 110000.0
-            
-            # If provisional, shrink RD at slower rate
-            if is_prov:
-                prov_rd_ratio = cfg.get("PROVISIONAL_RD_CONTRACTION_RATIO", 0.35) or 0.35
-            else:
-                prov_rd_ratio = 1.00
+            prov_rd_ratio = (cfg.get("PROVISIONAL_RD_CONTRACTION_RATIO", 0.35) or 0.35) if is_prov else 1.00
 
             inv_prior = 1.0 / (p_rd**2)
             inv_info = (mc * s_margin * (g_opp**2) * omega_cohort * prov_rd_ratio) / float(rd_denom)
@@ -837,7 +841,6 @@ elif nav == "🎾 Log Matches":
     match_log_date = col_dt1.date_input("Match Date Contested", value=date.today())
     match_log_time = col_dt2.time_input("Match Time Contested", value=datetime.now().time())
     
-    # Combined ISO Timestamp
     custom_match_ts = datetime.combine(match_log_date, match_log_time).isoformat()
 
     st.markdown("---")
@@ -1221,11 +1224,11 @@ elif nav == "📜 Historical Matches":
                         st.write("• **Bit 7 (Volatility K-Base):** ✅ Computed")
                         st.write(f"• **Bit 8 (Elite Drag):** {'✅ ACTIVATED' if any(pl['post_latent_mmr'] >= 6.3 for pl in p_logs) else 'Bypassed'}")
                         st.write(f"• **Bit 9 (Format Multiplier):** ✅ M_C = {m['applied_m_c']:.2f}")
-                        st.write("• **Bit 10 (Asymmetric Ice-Out):** Evaluated")
-                        st.write("• **Bit 11 (RD Contraction):** ✅ Bayesian shrinkage committed")
+                        st.write("• **Bit 10 (Status-Dependent Ice-Out):** ✅ Evaluated (Option A Active)")
+                        st.write("• **Bit 11 (RD Contraction):** ✅ Decoupled Bayesian shrinkage")
                         st.write(f"• **Bit 12 (Elevator Protocol):** {'🚀 ACTIVATED (3x)' if any(pl['is_elevator_active'] == 1 for pl in p_logs) else 'Bypassed'}")
                     with b_col2:
-                        st.write(f"• **Bit 13/14/15 (Exchange Caps):** {'🏆 Uncapped' if m['is_tournament'] else '✅ 24H Cap Active'}")
+                        st.write(f"• **Bit 13/14/15 (Exchange Caps):** {'🏆 Uncapped' if m['is_tournament'] else '✅ Multi-Cap Active'}")
                         st.write("• **Bit 16 (Graph Centrality):** ✅ Applied")
                         st.write("• **Bit 17 (Quarantine):** Clean")
                         st.write("• **Bit 18 (Inactivity Rust):** Verified")
