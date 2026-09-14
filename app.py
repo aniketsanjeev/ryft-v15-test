@@ -3,7 +3,7 @@ import sqlite3
 import math
 import json
 import os
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, time
 import pandas as pd
 
 # ==============================================================================
@@ -106,6 +106,7 @@ def init_db(force_sync_params=False):
         accuracy_s_diversity REAL DEFAULT 0.0,
         calibration_tier TEXT DEFAULT 'PROVISIONAL',
         is_provisional INTEGER DEFAULT 1,
+        is_manually_verified INTEGER DEFAULT 0,
         verified_matches_count INTEGER DEFAULT 0,
         matches_won_count INTEGER DEFAULT 0,
         matches_lost_count INTEGER DEFAULT 0,
@@ -244,6 +245,7 @@ def init_db(force_sync_params=False):
     add_column_if_not_exists(c, "players", "accuracy_s_rd", "REAL DEFAULT 0.0")
     add_column_if_not_exists(c, "players", "accuracy_s_matches", "REAL DEFAULT 0.0")
     add_column_if_not_exists(c, "players", "accuracy_s_diversity", "REAL DEFAULT 0.0")
+    add_column_if_not_exists(c, "players", "is_manually_verified", "INTEGER DEFAULT 0")
     add_column_if_not_exists(c, "match_logs", "pre_display_rating", "REAL DEFAULT 3.0")
     add_column_if_not_exists(c, "match_logs", "post_display_rating", "REAL DEFAULT 3.0")
     add_column_if_not_exists(c, "matches", "guardrails_summary", "TEXT DEFAULT '[]'")
@@ -282,34 +284,52 @@ def init_db(force_sync_params=False):
         """, (fid, fname, cat, mc, tg, tp))
 
     master_params = [
-        ("R_MIN", 0.0000, 1, "Scale Absolute Floor", "Lowest allowed rating.", "Clamps lowest possible rating to 0.0000."),
-        ("R_MAX", 7.0000, 1, "Scale Absolute Ceiling", "Maximum rating bound.", "Locked at 7.0000 to preserve tier definitions."),
-        ("R_ELITE_THRESHOLD", 6.3000, 1, "Elite Drag Gate", "Rating where exponential drag starts.", "Lowering applies drag earlier."),
-        ("ELITE_DRAG_EXPONENT", 2.5, 1, "Elite Drag Curvature", "Steepness of the pro ceiling curve.", "Higher values make 7.0000 harder to reach."),
-        ("POWER_MEAN_P", 3.0, 1, "Doubles Cubic Exponent", "Anchor power mean weighting.", "3.0 gives a 70/30 anchor weighting bias."),
-        ("LOGISTIC_BETA", 2.0, 1, "Logistic Scale Factor", "Win odds sensitivity.", "Lowering (1.8) increases upset swings."),
-        ("K_MAX", 0.4000, 1, "Beginner Max Volatility", "Base step size at R = 0.000.", "Higher values accelerate beginner movement."),
-        ("K_MIN", 0.0800, 1, "Pro Min Volatility", "Base step size at R = 7.000.", "Lower values lock pro ratings tighter."),
-        ("MARGIN_BASE", 0.80, 1, "Margin Floor Factor", "Minimum factor for close games.", "Floor for 7-6 tiebreaks."),
-        ("MARGIN_SCALE", 0.40, 1, "Margin Blowout Scale", "Bonus multiplier for blowouts.", "Full blowout bonus = 1.20."),
+        ("R_MIN", 0.0000, 1, "Scale Absolute Floor", "Lowest allowed rating.", "Clamps lowest possible rating to 0.0000. Keep at 0.0000."),
+        ("R_MAX", 7.0000, 1, "Scale Absolute Ceiling", "Maximum rating bound.", "Locked at 7.0000 to preserve tier definitions. Never set above 7.0000."),
+        ("R_ELITE_THRESHOLD", 6.3000, 1, "Elite Drag Gate", "Rating where exponential drag starts.", "Lowering (e.g. to 6.000) applies drag earlier to lock pro tiers."),
+        ("ELITE_DRAG_EXPONENT", 2.5, 1, "Elite Drag Curvature", "Steepness of the pro ceiling curve.", "Higher values (3.0-3.5) make 7.0000 mathematically unbreachable."),
+        ("POWER_MEAN_P", 3.0, 1, "Doubles Cubic Exponent", "Anchor power mean weighting.", "3.0 gives a 70/30 anchor weighting bias toward stronger partner."),
+        ("LOGISTIC_BETA", 2.0, 1, "Logistic Scale Factor", "Win odds sensitivity.", "Lowering (1.8) increases upset swings; raising (2.5) softens rating movement."),
+        ("K_MAX", 0.4000, 1, "Beginner Max Volatility", "Base step size at R = 0.000.", "Higher values accelerate beginner movement out of bottom tier."),
+        ("K_MIN", 0.0800, 1, "Pro Min Volatility", "Base step size at R = 7.000.", "Lower values lock pro ratings tighter against noise."),
+        ("MARGIN_BASE", 0.80, 1, "Margin Floor Factor", "Minimum factor for close games.", "Floor for 7-6 tiebreaks. Lowering penalizes close finishes."),
+        ("MARGIN_SCALE", 0.40, 1, "Margin Blowout Scale", "Bonus multiplier for blowouts.", "Full blowout bonus = 1.20 (+20% points)."),
         ("ELEVATOR_MARGIN_THRESH", 1.1000, 1, "Elevator Margin Gate", "Margin required for 3x boost.", "Set to 1.10 so 6-0, 6-1 triggers the Elevator."),
-        ("ELEVATOR_ACCEL_FACTOR", 3.0, 1, "Elevator Boost Multiplier", "Multiplier applied to provisional blowouts.", "Triples step size for unranked winners."),
+        ("ELEVATOR_ACCEL_FACTOR", 3.0, 1, "Elevator Boost Multiplier", "Multiplier applied to provisional blowouts.", "Triples step size for unranked winners to fast-track smurfs."),
         ("MAX_ELEVATOR_DELTA", 0.7500, 1, "Elevator Placement Cap", "Max points a smurf can win in one blowout game.", "Bypasses casual daily ceiling up to +0.7500."),
+        
+        # Multi-Window Caps & Provisional Bypass
         ("MAX_8H_EXCHANGE_CAP", 0.0000, 0, "8-Hour Rolling Cap", "Tight-window point transfer cap.", "Active when > 0.0000."),
         ("MAX_12H_EXCHANGE_CAP", 0.0000, 0, "12-Hour Rolling Cap", "Half-day point transfer cap.", "Active when > 0.0000."),
-        ("MAX_24H_EXCHANGE_CAP", 0.1500, 1, "24-Hour Casual Cap", "Net 24-hour casual transfer ceiling.", "Prevents collusion farming."),
+        ("MAX_24H_EXCHANGE_CAP", 0.1500, 1, "24-Hour Casual Cap", "Net 24-hour casual transfer ceiling.", "Prevents collusion farming among friend pods."),
         ("MAX_48H_EXCHANGE_CAP", 0.0000, 0, "48-Hour Rolling Cap", "Weekend point transfer cap.", "Active when > 0.0000."),
+        ("PROVISIONAL_BYPASS_EXCHANGE_CAP", 1.0000, 1, "Provisional Cap Bypass / Relax", "Allows unranked players to swing wider.", "1.0 = Active; applies PROVISIONAL_CAP_MULTIPLIER to 24h cap."),
+        ("PROVISIONAL_CAP_MULTIPLIER", 2.5000, 1, "Provisional Cap Multiplier", "Multiplier on daily cap for provisional players.", "e.g. 2.5x on 0.1500 = 0.3750 cap for provisional accounts."),
         ("SESSION_EXCHANGE_CAP", 0.3000, 1, "Verified Session Cap", "Elevated cap for verified 6+ player events.", "Doubles the daily limit for club mixers."),
-        ("MIN_SESSION_PLAYERS", 6, 1, "Session Participant Floor", "Min players required to unlock session cap.", "Events below 6 revert to 0.1500 cap."),
+        ("MIN_SESSION_PLAYERS", 6, 1, "Session Participant Floor", "Min players required to unlock session cap.", "Events below 6 revert to casual cap."),
+        
+        # Uncertainty, Decoupled Contraction & Rust
         ("RD_MIN", 30.0, 1, "Certainty Floor", "Absolute uncertainty floor.", "Prevents RD from dropping below 30.0."),
         ("RD_MAX", 350.0, 1, "Unrated Starting RD", "Uncertainty assigned at registration.", "Baseline starting uncertainty for new accounts."),
-        ("RD_CONTRACTION_DENOMINATOR", 110000.0, 1, "RD Contraction Divisor", "Information precision denominator.", "Calibrated so RD steps down 350 -> 240 smoothly."),
-        ("INACTIVITY_CONSTANT", 12.0, 1, "Inactivity Rust Rate", "Monthly temporal uncertainty growth.", "Points of RD regained per inactive month."),
+        ("RD_CONTRACTION_DENOMINATOR", 110000.0, 1, "RD Contraction Divisor", "Information precision denominator.", "Calibrated divisor for Bayesian RD shrinkage."),
+        ("PROVISIONAL_RD_CONTRACTION_RATIO", 0.3500, 1, "Provisional RD Contraction Speed", "Slows RD drop for unranked players.", "0.35 = Provisional players shrink RD at 35% speed of verified players."),
+        ("PROVISIONAL_ACCURACY_DAMPENER", 0.4000, 1, "Provisional Accuracy Gain Dampener", "Restricts accuracy gain during placement.", "0.40 = Accuracy moves up marginally (40% speed) until verified."),
+        ("INACTIVITY_CONSTANT", 12.0, 1, "Inactivity Rust Rate", "Monthly temporal uncertainty growth.", "Points of RD regained per inactive month away from court."),
+        
+        # Provisional Cohort Factors (Omega Cohort)
+        ("COHORT_FACTOR_0_PROV", 1.0000, 1, "Omega: 0 Other Provisional Players", "Full information gain.", "1.00 = 100% full contraction speed when playing verified peers."),
+        ("COHORT_FACTOR_1_PROV", 0.7500, 1, "Omega: 1 Other Provisional Player", "Contraction slowdown.", "0.75 = 25% contraction slowdown when 1 other player is unranked."),
+        ("COHORT_FACTOR_2_PROV", 0.5000, 1, "Omega: 2 Other Provisional Players", "Contraction slowdown.", "0.50 = 50% contraction slowdown when 2 other players are unranked."),
+        ("COHORT_FACTOR_3_PROV", 0.2500, 1, "Omega: 3 Other Provisional Players", "Contraction slowdown (Sandbox).", "0.25 = 75% contraction slowdown when all 4 players are unranked."),
+        
+        # Bridges & Macro Normalization
         ("BRIDGE_RD_THRESHOLD", 80.0, 1, "Bridge Node Max RD", "Max RD to qualify as Bridge Node.", "Must have RD <= 80 to act as measuring traveler."),
         ("BRIDGE_MIN_MATCHES", 5, 1, "Bridge Match Minimum", "Away matches required to link locations.", "Matches required before a traveler links regional pools."),
         ("LAMBDA_BRIDGE_DAMPING", 3.0, 1, "Tikhonov Bridge Lambda", "Traveler shock absorber parameter.", "Higher values require more travelers before an offset deploys."),
         ("CIRCUIT_BREAKER", 0.0250, 1, "Auto Cron Safety Ceiling", "Maximum shift per automated cycle.", "Limits automated Sunday macro shifts to +/-0.0250."),
         ("ADMIN_OVERRIDE_MAX", 0.0750, 1, "Admin Sandbox Shift Window", "Max human-approved offset.", "Ceiling for manual Admin calibration deployments."),
+        
+        # Accuracy & Tri-Gate Governance
         ("ACCURACY_WEIGHT_RD", 0.50, 1, "Accuracy Weight: RD", "Weight for Pillar 1.", "Controls influence of mathematical uncertainty (RD)."),
         ("ACCURACY_WEIGHT_MATCHES", 0.25, 1, "Accuracy Weight: Matches", "Weight for Pillar 2.", "Controls importance of verified match volume."),
         ("ACCURACY_WEIGHT_DIVERSITY", 0.25, 1, "Accuracy Weight: Diversity", "Weight for Pillar 3.", "Controls importance of playing unique opponents."),
@@ -437,7 +457,7 @@ class RyftEngineV15:
         conn.close()
 
     @staticmethod
-    def calculate_accuracy_suite(rd, match_count, opp_count, is_currently_prov, cfg):
+    def calculate_accuracy_suite(rd, match_count, opp_count, is_currently_prov, is_manually_verified, cfg):
         rd_min = cfg.get("RD_MIN", 30.0) or 30.0
         rd_max = cfg.get("RD_MAX", 350.0) or 350.0
         
@@ -453,21 +473,33 @@ class RyftEngineV15:
         w_m = cfg.get("ACCURACY_WEIGHT_MATCHES", 0.25) if cfg.get("ACCURACY_WEIGHT_MATCHES") is not None else 0.25
         w_d = cfg.get("ACCURACY_WEIGHT_DIVERSITY", 0.25) if cfg.get("ACCURACY_WEIGHT_DIVERSITY") is not None else 0.25
 
-        composite_acc = round(((w_rd * s_rd) + (w_m * s_matches) + (w_d * s_diversity)) * 100.0, 2)
+        raw_acc = ((w_rd * s_rd) + (w_m * s_matches) + (w_d * s_diversity)) * 100.0
+
+        # Dampen provisional accuracy progression
+        if is_currently_prov and not is_manually_verified:
+            p_acc_damp = cfg.get("PROVISIONAL_ACCURACY_DAMPENER", 0.40) or 0.40
+            raw_acc = raw_acc * p_acc_damp
+
+        composite_acc = round(raw_acc, 2)
 
         prov_rd_gate = cfg.get("PROVISIONAL_RD_GATE", 100.0) or 100.0
         prov_min_m = cfg.get("PROVISIONAL_MIN_MATCHES", 5) or 5
         prov_min_d = cfg.get("PROVISIONAL_MIN_OPPONENTS", 3) or 3
 
         tri_gate_passed = (rd <= prov_rd_gate and match_count >= prov_min_m and opp_count >= prov_min_d)
-        new_is_prov = 0 if tri_gate_passed else 1
+        
+        # PERSISTENT OVERRIDE LOGIC: If manually verified, never force back to provisional
+        if is_manually_verified:
+            new_is_prov = 0
+        else:
+            new_is_prov = 0 if tri_gate_passed else 1
 
         tier_prov_max = cfg.get("TIER_PROVISIONAL_MAX", 69.99) or 69.99
         tier_ver_max = cfg.get("TIER_VERIFIED_MAX", 89.99) or 89.99
 
         if composite_acc >= tier_ver_max and new_is_prov == 0 and rd <= 60.0 and match_count >= 15 and opp_count >= 8:
             cal_tier = "ANCHOR"
-        elif (composite_acc >= tier_prov_max or tri_gate_passed) and new_is_prov == 0:
+        elif (composite_acc >= tier_prov_max or tri_gate_passed or is_manually_verified) and new_is_prov == 0:
             cal_tier = "VERIFIED"
         else:
             cal_tier = "PROVISIONAL"
@@ -479,7 +511,7 @@ class RyftEngineV15:
             "composite_accuracy": composite_acc,
             "calibration_tier": cal_tier,
             "is_provisional": new_is_prov,
-            "tri_gate_passed": tri_gate_passed
+            "tri_gate_passed": tri_gate_passed or bool(is_manually_verified)
         }
 
     @staticmethod
@@ -542,6 +574,10 @@ class RyftEngineV15:
         conn.close()
         mc = fmt["mc_weight"] if fmt else 1.00
 
+        # Map court participant provisional states for Omega Cohort calculation
+        court_all = [p1, p3] + ([p2, p4] if not is_singles else [])
+        prov_map = {p["player_id"]: (p["is_provisional"] == 1 and not p.get("is_manually_verified", 0)) for p in court_all}
+
         if is_singles:
             participants = [(p1, True, None, p3["rating_deviation"]), (p3, False, None, p1["rating_deviation"])]
         else:
@@ -563,8 +599,10 @@ class RyftEngineV15:
 
         for p_data, is_team_a, partner_r, opp_rd in participants:
             p_flags = []
+            pid = p_data["player_id"]
             r_curr = p_data["latent_mmr"]
             p_rd = p_data["rating_deviation"]
+            is_prov = (p_data["is_provisional"] == 1 and not p_data.get("is_manually_verified", 0))
             is_winner = (is_team_a and score_a > score_b) or (not is_team_a and score_b > score_a)
             
             k_base = k_max - (r_curr / r_max) * (k_max - k_min)
@@ -574,11 +612,11 @@ class RyftEngineV15:
                 k_base *= speed_mult
                 p_flags.append(f"SPEED_RULE_APPLIED: Adjusted by {speed_mult:.2f}x for rating tier.")
 
-            # Bit 12: Elevator Protocol (Enforces threshold gate)
+            # Bit 12: Elevator Protocol
             is_elevator = False
             el_thresh = cfg.get("ELEVATOR_MARGIN_THRESH", 1.1000) or 1.1000
             el_factor = cfg.get("ELEVATOR_ACCEL_FACTOR", 3.0) or 3.0
-            if p_data["is_provisional"] and s_margin >= el_thresh and is_winner and r_curr < r_elite:
+            if is_prov and s_margin >= el_thresh and is_winner and r_curr < r_elite:
                 k_base *= el_factor
                 is_elevator = True
                 p_flags.append("ELEVATOR_3X_BOOST: Provisional blowout victory; step rate tripled.")
@@ -614,7 +652,16 @@ class RyftEngineV15:
                     dampened_delta = raw_delta * d_factor
                     p_flags.append(f"ICE_OUT_NOVICE_DAMPENED: Partner gap >= {gap:.1f}; anti-carry gain reduced by {int((1-d_factor)*100)}%.")
 
-            # Exchange Cap Clamping
+            # Exchange Cap Clamping with Provisional Cap Multiplier
+            cap_24 = cfg.get("MAX_24H_EXCHANGE_CAP", 0.1500) or 0.1500
+            prov_cap_bypass = cfg.get("PROVISIONAL_BYPASS_EXCHANGE_CAP", 1.0) or 1.0
+            prov_cap_mult = cfg.get("PROVISIONAL_CAP_MULTIPLIER", 2.5) or 2.5
+
+            if is_prov and prov_cap_bypass == 1.0:
+                effective_cap = cap_24 * prov_cap_mult
+            else:
+                effective_cap = cap_24
+
             if is_tournament:
                 final_delta = dampened_delta
                 p_flags.append("TOURNAMENT_OVERRIDE: Verified tournament desk match; daily caps bypassed.")
@@ -622,24 +669,49 @@ class RyftEngineV15:
                 max_el = cfg.get("MAX_ELEVATOR_DELTA", 0.7500) or 0.7500
                 final_delta = max(-max_el, min(max_el, dampened_delta))
             else:
-                cap_24 = cfg.get("MAX_24H_EXCHANGE_CAP", 0.1500) or 0.1500
-                final_delta = max(-cap_24, min(cap_24, dampened_delta))
-                if abs(dampened_delta) > cap_24:
-                    p_flags.append("24H_EXCHANGE_CAP_CLAMPED: Reached daily casual exchange ceiling (0.1500 points).")
+                final_delta = max(-effective_cap, min(effective_cap, dampened_delta))
+                if abs(dampened_delta) > effective_cap:
+                    p_flags.append(f"EXCHANGE_CAP_CLAMPED: Capped at {effective_cap:.4f} (Provisional cap: {effective_cap:.4f}).")
 
             new_r = max(0.0000, min(6.9999, r_curr + final_delta))
 
-            # Bit 11: Calibrated Bayesian Uncertainty Contraction
+            # Omega Cohort Factor Calculation: Count OTHER provisional players on court
+            other_prov_count = sum(1 for op_id in prov_map if op_id != pid and prov_map[op_id])
+            if other_prov_count == 0:
+                omega_cohort = cfg.get("COHORT_FACTOR_0_PROV", 1.00) or 1.00
+            elif other_prov_count == 1:
+                omega_cohort = cfg.get("COHORT_FACTOR_1_PROV", 0.75) or 0.75
+            elif other_prov_count == 2:
+                omega_cohort = cfg.get("COHORT_FACTOR_2_PROV", 0.50) or 0.50
+            else:
+                omega_cohort = cfg.get("COHORT_FACTOR_3_PROV", 0.25) or 0.25
+
+            # Decoupled Bayesian Uncertainty Contraction
             rd_denom = cfg.get("RD_CONTRACTION_DENOMINATOR", 110000.0) or 110000.0
+            
+            # If provisional, shrink RD at slower rate
+            if is_prov:
+                prov_rd_ratio = cfg.get("PROVISIONAL_RD_CONTRACTION_RATIO", 0.35) or 0.35
+            else:
+                prov_rd_ratio = 1.00
+
             inv_prior = 1.0 / (p_rd**2)
-            inv_info = (mc * s_margin * (g_opp**2)) / float(rd_denom)
+            inv_info = (mc * s_margin * (g_opp**2) * omega_cohort * prov_rd_ratio) / float(rd_denom)
             new_rd = max(30.0, min(350.0, math.sqrt(1.0 / (inv_prior + inv_info))))
 
-            # Module 8: Accuracy & Calibration Status
+            if is_prov:
+                p_flags.append(f"PROVISIONAL_RD_SLOWED: Contraction slowed to {int(prov_rd_ratio*100)}% speed; Omega={omega_cohort:.2f}.")
+
+            # Accuracy & Calibration Status Evaluation
             new_matches = p_data["verified_matches_count"] + (0 if is_dry_run else 1)
             new_opps = p_data["unique_opponents_count"] + (0 if is_dry_run else 1)
             
-            acc_suite = cls.calculate_accuracy_suite(new_rd, new_matches, new_opps, bool(p_data["is_provisional"]), cfg)
+            acc_suite = cls.calculate_accuracy_suite(
+                new_rd, new_matches, new_opps, 
+                bool(p_data["is_provisional"]), 
+                bool(p_data.get("is_manually_verified", 0)), 
+                cfg
+            )
 
             results.append({
                 "player_id": p_data["player_id"],
@@ -666,8 +738,6 @@ class RyftEngineV15:
 # ==============================================================================
 # 3. STREAMLIT COMMAND & OPERATIONAL INTERFACE
 # ==============================================================================
-st.set_page_config(page_title="RYFT Engine V.15 Platform", layout="wide")
-
 st.sidebar.title("⚡ RYFT Engine V.15")
 active_operator = st.sidebar.selectbox("Active Operator:", ["Aniket (Admin)", "Manish", "Nithin", "Ritesh", "Tournament Desk"])
 st.sidebar.caption("Deterministic Micro Physics & Topological Calibration")
@@ -760,6 +830,16 @@ elif nav == "🎾 Log Matches":
 
     selected_fmt = f_dict[fmt_name] if fmt_name else None
 
+    # Match Timestamp Selection (Date & Time Inputs)
+    st.markdown("---")
+    st.markdown("### Match Timestamp Configuration")
+    col_dt1, col_dt2 = st.columns(2)
+    match_log_date = col_dt1.date_input("Match Date Contested", value=date.today())
+    match_log_time = col_dt2.time_input("Match Time Contested", value=datetime.now().time())
+    
+    # Combined ISO Timestamp
+    custom_match_ts = datetime.combine(match_log_date, match_log_time).isoformat()
+
     st.markdown("---")
     st.markdown("### Roster Selection")
     col_ta, col_tb = st.columns(2)
@@ -794,12 +874,12 @@ elif nav == "🎾 Log Matches":
             
             s1_c1, s1_c2 = st.columns(2)
             s1_a = s1_c1.number_input("Set 1: Team A Games", 0, 7, 6, key="s1_a")
-            s1_b = s1_c2.number_input("Set 1: Team B Games", 0, 7, 3, key="s1_b")
+            s1_b = s1_c2.number_input("Set 1: Team B Games", 0, 7, 0, key="s1_b")
             sets_recorded.append((s1_a, s1_b))
 
             s2_c1, s2_c2 = st.columns(2)
             s2_a = s2_c1.number_input("Set 2: Team A Games", 0, 7, 6, key="s2_a")
-            s2_b = s2_c2.number_input("Set 2: Team B Games", 0, 7, 4, key="s2_b")
+            s2_b = s2_c2.number_input("Set 2: Team B Games", 0, 7, 1, key="s2_b")
             sets_recorded.append((s2_a, s2_b))
 
             a_sets = (1 if s1_a > s1_b else 0) + (1 if s2_a > s2_b else 0)
@@ -843,10 +923,16 @@ elif nav == "🎾 Log Matches":
     click_save = btn_save_c.button("💾 Verify & Save Match", type="primary", use_container_width=True)
 
     if click_sim or click_save:
+        # Check duplicate selection
+        selected_pids = [p_map[p] for p in [p1_pick, p2_pick, p3_pick, p4_pick] if p not in ("-- Select --", "-- None --")]
+        has_dups = (len(selected_pids) != len(set(selected_pids)))
+
         if not v_map or not p_map:
             st.error("Please add venues and players before calculating matches.")
         elif p1_pick == "-- Select --" or p3_pick == "-- Select --" or (is_doubles and (p2_pick == "-- Select --" or p4_pick == "-- Select --")):
             st.error("Please assign players to all required roster slots.")
+        elif has_dups:
+            st.error("⚠️ Validation Error: Duplicate player selected! All players on court must be unique.")
         else:
             is_valid, err_msg = RyftEngineV15.validate_score(
                 selected_fmt["format_id"], selected_fmt["category"],
@@ -904,7 +990,6 @@ elif nav == "🎾 Log Matches":
                 if click_save:
                     conn = get_db_connection()
                     m_id = f"M_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                    ts = datetime.now(timezone.utc).isoformat()
                     
                     all_guardrails = []
                     for pr in res["player_results"]:
@@ -929,7 +1014,7 @@ elif nav == "🎾 Log Matches":
                         res["player_results"][1]["delta_r"] if is_doubles else 0.0,
                         res["player_results"][2]["delta_r"] if is_doubles else res["player_results"][1]["delta_r"],
                         res["player_results"][3]["delta_r"] if is_doubles else 0.0,
-                        json.dumps(all_guardrails), ts
+                        json.dumps(all_guardrails), custom_match_ts
                     ))
 
                     for r in res["player_results"]:
@@ -951,7 +1036,7 @@ elif nav == "🎾 Log Matches":
                             acc["composite_accuracy"], acc["s_rd_pct"], acc["s_matches_pct"], acc["s_diversity_pct"],
                             acc["calibration_tier"], acc["is_provisional"],
                             1 if r["delta_r"] > 0 else 0, 1 if r["delta_r"] < 0 else 0, 
-                            r["post_r"], r["post_r"], r["post_r"], ts, r["player_id"]
+                            r["post_r"], r["post_r"], r["post_r"], custom_match_ts, r["player_id"]
                         ))
 
                         conn.execute('''
@@ -964,7 +1049,7 @@ elif nav == "🎾 Log Matches":
                             f"LOG_{r['player_id']}_{m_id}", m_id, r["player_id"], r["pre_r"], r["post_r"],
                             r["pre_r"], r["post_r"], r["pre_rd"], r["post_rd"], 
                             r["accuracy_suite"]["composite_accuracy"], r["accuracy_suite"]["composite_accuracy"], r["delta_r"],
-                            r["is_elevator"], json.dumps(r["guardrails"]), ts
+                            r["is_elevator"], json.dumps(r["guardrails"]), custom_match_ts
                         ))
 
                     conn.execute("UPDATE venues SET total_matches_played = total_matches_played + 1 WHERE venue_id = ?", (v_map[ven_name],))
@@ -1085,7 +1170,7 @@ elif nav == "📜 Historical Matches":
                 st.markdown(f"""
                 <div style="border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px; margin-bottom: 10px; background-color: #f8fafc;">
                     <span style="font-size: 1.1em; font-weight: bold; color: #0f172a;">🎾 {m['match_id']}</span> 
-                    <span style="float: right; color: #64748b; font-size: 0.9em;">📅 {m['match_timestamp'][:19]}</span><br/>
+                    <span style="float: right; color: #64748b; font-size: 0.9em;">📅 {m['match_timestamp'][:19].replace('T', ' ')}</span><br/>
                     <strong>Venue:</strong> {m['venue_name']} ({m['city_name']}) | <strong>Format:</strong> {m['format_name']} | <span style="color: #0369a1; font-weight: 600;">{b_str}</span>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1246,7 +1331,7 @@ elif nav == "👥 Players Roster":
     p_query = """
         SELECT p.player_id, p.display_name, p.latent_mmr, p.display_rating, p.rating_deviation, p.rating_accuracy_pct,
                p.accuracy_s_rd as certainty_pct, p.accuracy_s_matches as sample_pct, p.accuracy_s_diversity as diversity_pct,
-               p.calibration_tier, p.is_provisional, p.verified_matches_count, p.unique_opponents_count, 
+               p.calibration_tier, p.is_provisional, p.is_manually_verified, p.verified_matches_count, p.unique_opponents_count, 
                p.is_anchor, p.is_ceiling_anchor, p.is_active_bridge,
                l.location_name as city_name, co.location_name as country_name
         FROM players p 
@@ -1323,9 +1408,9 @@ elif nav == "👥 Players Roster":
                         conn.execute('''
                             INSERT INTO players (player_id, display_name, initial_rating, home_venue_id, home_city_id,
                                                  home_country_code, latent_mmr, display_rating, rolling_90d_peak, rolling_180d_peak,
-                                                 rolling_365d_peak, rating_deviation, is_provisional, calibration_tier,
+                                                 rolling_365d_peak, rating_deviation, is_provisional, is_manually_verified, calibration_tier,
                                                  is_anchor, is_ceiling_anchor, created_at)
-                            VALUES (?, ?, ?, ?, ?, 'IND', ?, ?, ?, ?, ?, 350.0, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, 'IND', ?, ?, ?, ?, ?, 350.0, ?, 0, ?, ?, ?, ?)
                         ''', (p_uuid, name, init_r, v_id, c_id, init_r, init_r, init_r, init_r, init_r, 
                               1 if start_prov else 0, 'PROVISIONAL' if start_prov else 'VERIFIED',
                               1 if is_anc else 0, 1 if is_ceil else 0, datetime.now(timezone.utc).isoformat()))
@@ -1379,23 +1464,27 @@ elif nav == "👥 Players Roster":
                     
                     b_sub, b_del = st.columns(2)
                     if b_sub.form_submit_button("Save Parameter Overrides"):
+                        # If admin explicitly unchecked provisional or picked VERIFIED/ANCHOR, set manual override
+                        is_manual_override = 1 if (not e_prov or e_tier in ("VERIFIED", "ANCHOR")) else 0
+
                         conn = get_db_connection()
                         conn.execute('''
                             UPDATE players SET display_name = ?, latent_mmr = ?, display_rating = ?,
                                                rating_deviation = ?, rating_accuracy_pct = ?, calibration_tier = ?, 
-                                               is_provisional = ?, is_anchor = ?, is_ceiling_anchor = ?
+                                               is_provisional = ?, is_manually_verified = ?, is_anchor = ?, is_ceiling_anchor = ?
                             WHERE player_id = ?
-                        ''', (e_name, e_mmr, e_disp, e_rd, e_acc, e_tier, 1 if e_prov else 0, 1 if e_anc else 0, 1 if e_ceil else 0, p_sel_id))
+                        ''', (e_name, e_mmr, e_disp, e_rd, e_acc, e_tier, 
+                              1 if e_prov else 0, is_manual_override, 1 if e_anc else 0, 1 if e_ceil else 0, p_sel_id))
                         
                         conn.execute('''
                             INSERT INTO player_changelog (player_id, change_type, old_val, new_val, changed_by, changed_at)
                             VALUES (?, 'MANUAL_OVERRIDE', ?, ?, ?, ?)
                         ''', (p_sel_id, f"MMR: {p_cur['latent_mmr']:.3f}, RD: {p_cur['rating_deviation']:.1f}",
-                              f"MMR: {e_mmr:.3f}, RD: {e_rd:.1f}, Tier: {e_tier}", active_operator, datetime.now(timezone.utc).isoformat()))
+                              f"MMR: {e_mmr:.3f}, RD: {e_rd:.1f}, Tier: {e_tier}, ManualVerified: {is_manual_override}", active_operator, datetime.now(timezone.utc).isoformat()))
                         
                         conn.commit()
                         conn.close()
-                        st.success("Player overrides committed!")
+                        st.success("Player overrides committed & locked against auto Tri-Gate reversal!")
                         st.rerun()
 
                     if b_del.form_submit_button("🗑️ Delete Player"):
@@ -1667,7 +1756,7 @@ elif nav == "⚙️ Global Config Switches":
 
     # FORCE PARAMETER SYNC TOOL
     with st.expander("🔄 Force Sync Parameter Defaults (Fix Stale Parameters)"):
-        st.write("Updates existing database parameters to the latest code defaults (e.g. Setting Elevator Threshold to 1.10) without touching player or match tables.")
+        st.write("Updates existing database parameters to the latest code defaults without touching player or match tables.")
         if st.button("Sync Config Parameters to V.15 Defaults", type="primary"):
             init_db(force_sync_params=True)
             st.success("Successfully synchronized all config parameters to latest V.15 defaults!")
